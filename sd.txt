@@ -1,0 +1,244 @@
+def query_qdrant_for_context(query_text, query_tool=None, top_k=5, url="http://localhost:6333", api_key=None, collection_name="document_collection"):
+    """
+    Query Qdrant vector database for documents related to a question.
+    
+    Args:
+        query_text (str): The user's question or query
+        query_tool (QdrantQueryTool, optional): An existing QdrantQueryTool instance
+        top_k (int): Number of documents to retrieve
+        url (str): Qdrant server URL
+        api_key (str, optional): API key for Qdrant
+        collection_name (str): Name of the collection to query
+        
+    Returns:
+        List of relevant documents with text and metadata
+    """
+    import logging
+    import numpy as np
+    
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Initialize the query tool if not provided
+    if not query_tool:
+        try:
+            query_tool = QdrantQueryTool(
+                url=url,
+                api_key=api_key,
+                collection_name=collection_name
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize QdrantQueryTool: {str(e)}")
+            return []
+    
+    # Extract keywords for text search
+    keywords = extract_keywords(query_text)
+    keyword_str = " ".join(keywords[:3])  # Use top 3 keywords
+    
+    logger.info(f"Querying Qdrant for: '{query_text}'")
+    logger.info(f"Using keywords: {keyword_str}")
+    
+    # Try to get embeddings for the query
+    try:
+        # First attempt using Azure OpenAI embeddings if available
+        query_embedding = get_query_embedding(query_text)
+        
+        # If we have embeddings, perform hybrid search
+        if query_embedding and len(query_embedding) > 0:
+            logger.info("Performing hybrid search with embedding and keywords")
+            results = query_tool.hybrid_search(
+                vector=query_embedding,
+                keyword=keyword_str,
+                limit=top_k
+            )
+        else:
+            # Fallback to keyword search if embeddings fail
+            logger.info("Embeddings unavailable, falling back to keyword search")
+            results = query_tool.keyword_search(keyword=keyword_str, limit=top_k)
+            
+    except Exception as e:
+        logger.error(f"Error during vector search: {str(e)}")
+        # Fallback to keyword search
+        logger.info("Error in embeddings, falling back to keyword search")
+        results = query_tool.keyword_search(keyword=keyword_str, limit=top_k)
+    
+    # Format the results
+    context_docs = []
+    for result in results:
+        # Extract the document text
+        doc_text = result.get('text', '')
+        
+        # Extract metadata
+        metadata = result.get('metadata', {})
+        
+        # Add to context documents
+        context_docs.append({
+            "text": doc_text,
+            "metadata": metadata,
+            "score": result.get('score', 0.0),
+        })
+    
+    logger.info(f"Retrieved {len(context_docs)} relevant documents")
+    return context_docs
+
+def extract_keywords(text):
+    """
+    Extract important keywords from the query text.
+    This is a simple implementation - could be improved with NLP libraries.
+    
+    Args:
+        text (str): The query text
+        
+    Returns:
+        list: List of keywords
+    """
+    import re
+    
+    # Convert to lowercase and remove punctuation
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    
+    # Split into words
+    words = text.split()
+    
+    # Remove common stopwords
+    stopwords = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 
+                'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'like', 
+                'from', 'of', 'as', 'what', 'when', 'where', 'who', 'why', 'how'}
+    
+    keywords = [word for word in words if word not in stopwords]
+    
+    return keywords
+
+def get_query_embedding(query_text):
+    """
+    Get embedding vector for the query text.
+    Tries to use Azure OpenAI embeddings first, then falls back to another method.
+    
+    Args:
+        query_text (str): The query text
+        
+    Returns:
+        list: Embedding vector or None if unavailable
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Try to use Azure OpenAI embeddings if the function is available
+        try:
+            # Check if the get_azure_embeddings function is available in the global scope
+            if 'get_azure_embeddings' in globals():
+                embeddings = get_azure_embeddings([query_text])
+                if embeddings and len(embeddings) > 0:
+                    return embeddings[0]
+        except Exception as e:
+            logger.warning(f"Azure embeddings failed: {str(e)}")
+            pass
+        
+        # If we reach here, Azure embeddings weren't available
+        # You could implement an alternative embedding method here
+        logger.warning("No embedding method available")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting query embedding: {str(e)}")
+        return None
+
+def get_context_for_question(question, url="http://localhost:6333", api_key=None, collection="document_collection", top_k=5):
+    """
+    Main function to get context for a question from Qdrant.
+    
+    Args:
+        question (str): The user's question
+        url (str): Qdrant server URL
+        api_key (str, optional): API key for Qdrant
+        collection (str): Name of the collection to query
+        top_k (int): Number of documents to retrieve
+        
+    Returns:
+        str: Formatted context from relevant documents
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"Getting context for question: {question}")
+    
+    # Initialize QdrantQueryTool
+    try:
+        query_tool = QdrantQueryTool(
+            url=url,
+            api_key=api_key,
+            collection_name=collection
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize QdrantQueryTool: {str(e)}")
+        return f"Error connecting to vector database: {str(e)}"
+    
+    # Get relevant documents
+    documents = query_qdrant_for_context(
+        query_text=question,
+        query_tool=query_tool,
+        top_k=top_k
+    )
+    
+    if not documents:
+        return "No relevant documents found in the database."
+    
+    # Format the context
+    context_text = "Relevant context from documents:\n\n"
+    
+    for i, doc in enumerate(documents, 1):
+        # Add document text with source info
+        source = doc.get('metadata', {}).get('source', 'Unknown source')
+        title = doc.get('metadata', {}).get('title', 'Untitled document')
+        
+        context_text += f"Document {i}:\n"
+        context_text += f"Title: {title}\n"
+        context_text += f"Source: {source}\n"
+        
+        # Add score if available
+        if 'score' in doc and doc['score'] is not None:
+            context_text += f"Relevance: {doc['score']:.4f}\n"
+        
+        # Add the document text
+        doc_text = doc.get('text', '').strip()
+        if len(doc_text) > 1000:
+            doc_text = doc_text[:997] + "..."
+            
+        context_text += f"Content:\n{doc_text}\n\n"
+        context_text += "-" * 50 + "\n\n"
+    
+    return context_text
+
+# Example usage
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Get context from Qdrant for a question")
+    parser.add_argument("question", type=str, help="The question to get context for")
+    parser.add_argument("--url", type=str, default="http://localhost:6333", help="Qdrant server URL")
+    parser.add_argument("--api_key", type=str, help="Qdrant API key (if needed)")
+    parser.add_argument("--collection", type=str, default="document_collection", help="Collection name")
+    parser.add_argument("--top_k", type=int, default=5, help="Number of documents to retrieve")
+    parser.add_argument("--output", type=str, help="Output file for results (text)")
+    
+    args = parser.parse_args()
+    
+    # Get context for the question
+    context = get_context_for_question(
+        question=args.question,
+        url=args.url,
+        api_key=args.api_key,
+        collection=args.collection,
+        top_k=args.top_k
+    )
+    
+    # Output results
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(context)
+        print(f"Results saved to {args.output}")
+    else:
+        print(context)
