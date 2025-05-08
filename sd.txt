@@ -1,1 +1,391 @@
+import os
+import numpy as np
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from openai import AzureOpenAI
 
+# Load environment variables
+load_dotenv()
+
+# Azure OpenAI credentials
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+
+# Qdrant connection details
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+# Collection name
+COLLECTION_NAME = "document_collection"
+
+def search_documents(query_text, limit=5):
+    """
+    Search documents in Qdrant that are relevant to the query
+    """
+    try:
+        # Initialize Azure OpenAI client
+        azure_client = AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT
+        )
+        
+        # Initialize Qdrant client
+        qdrant_client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY
+        )
+        
+        # Get collection info to check vector dimensions
+        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+        expected_dim = collection_info.config.params.vectors.size
+        print(f"Qdrant collection expects {expected_dim}-dimensional vectors")
+        
+        # Generate embedding for the query using Azure OpenAI
+        response = azure_client.embeddings.create(
+            input=query_text,
+            model=AZURE_OPENAI_DEPLOYMENT_NAME
+        )
+        original_vector = response.data[0].embedding
+        print(f"Azure OpenAI generated {len(original_vector)}-dimensional vectors")
+        
+        # Handle dimension mismatch
+        if len(original_vector) != expected_dim:
+            print(f"Resizing vector from {len(original_vector)} to {expected_dim} dimensions")
+            if len(original_vector) > expected_dim:
+                # Option 1: Truncate the vector (take first expected_dim elements)
+                query_vector = original_vector[:expected_dim]
+                
+                # Option 2 (alternative): Use PCA or other dimensionality reduction
+                # from sklearn.decomposition import PCA
+                # pca = PCA(n_components=expected_dim)
+                # query_vector = pca.fit_transform([original_vector])[0].tolist()
+            else:
+                # If original vector is smaller, pad with zeros
+                query_vector = original_vector + [0] * (expected_dim - len(original_vector))
+        else:
+            query_vector = original_vector
+        
+        # Search Qdrant for similar documents
+        search_results = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=limit,
+            with_payload=True,
+            score_threshold=0.5  # Lowered threshold due to dimension adjustment
+        )
+        
+        # Format and return results
+        results = []
+        for result in search_results:
+            results.append({
+                "document": result.payload.get("text", "No text available"),
+                "metadata": {
+                    key: value for key, value in result.payload.items() 
+                    if key != "text"
+                },
+                "score": result.score
+            })
+        
+        return results
+    
+    except Exception as e:
+        print(f"Error searching documents: {e}")
+        return []
+
+def main():
+    # Example usage
+    user_query = input("Enter your query: ")
+    print(f"\nSearching for documents relevant to: '{user_query}'")
+    
+    results = search_documents(user_query)
+    
+    if not results:
+        print("No relevant documents found.")
+    else:
+        print("\nFound the following relevant documents:")
+        for i, result in enumerate(results, 1):
+            print(f"\n--- Result {i} (Relevance Score: {result['score']:.4f}) ---")
+            print(f"Document: {result['document'][:]}...")
+            if result['metadata']:
+                print("Metadata:")
+                for key, value in result['metadata'].items():
+                    print(f"  - {key}: {value}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+import os
+import glob
+import hashlib
+from tqdm import tqdm
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, PointStruct
+from openai import AzureOpenAI
+
+# Load environment variables
+load_dotenv()
+
+# Azure OpenAI credentials
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+
+# Qdrant connection details
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+# Collection name
+COLLECTION_NAME = "document_collection"
+
+# Content directory to scan for PDF documents
+CONTENT_DIR = "content"  # Change this to your content directory path
+
+# Batch size for embedding generation and upload
+BATCH_SIZE = 10
+
+def setup_collection(client, vector_size=1536):
+    """
+    Create or recreate the collection with the specified vector size
+    """
+    # Check if collection exists
+    if client.collection_exists(COLLECTION_NAME):
+        print(f"Collection '{COLLECTION_NAME}' already exists. Recreate? (y/n)")
+        if input().lower() == 'y':
+            client.delete_collection(COLLECTION_NAME)
+            print(f"Collection '{COLLECTION_NAME}' deleted.")
+        else:
+            print(f"Using existing collection '{COLLECTION_NAME}'.")
+            return
+    
+    # Create collection with the correct vector size
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+    )
+    print(f"Collection '{COLLECTION_NAME}' created with vector size {vector_size}.")
+
+def extract_text_from_pdf(file_path):
+    """
+    Extract text from PDF file using PyPDF2
+    """
+    try:
+        import PyPDF2
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            total_pages = len(reader.pages)
+            print(f"Processing PDF: {os.path.basename(file_path)} - {total_pages} pages")
+            
+            text = ""
+            for i, page in enumerate(reader.pages):
+                page_text = page.extract_text()
+                if page_text:
+                    text += f"--- Page {i+1} ---\n{page_text}\n\n"
+            
+            return text
+    except ImportError:
+        print("PyPDF2 not installed. Install with: pip install PyPDF2")
+        return None
+    except Exception as e:
+        print(f"Error extracting text from {file_path}: {e}")
+        return None
+
+def chunk_text(text, max_chunk_size=4000, overlap=200):
+    """
+    Split text into chunks with overlap
+    """
+    if not text or len(text) <= max_chunk_size:
+        return [text] if text else []
+    
+    chunks = []
+    start = 0
+    
+    while start < len(text):
+        # Determine end position
+        end = start + max_chunk_size
+        
+        # If we're not at the end of the text, try to find a good break point
+        if end < len(text):
+            # Try to break at page markers first
+            page_marker_pos = text.rfind("--- Page ", start, end)
+            if page_marker_pos > start:
+                # Find the beginning of that line
+                line_start = text.rfind("\n", start, page_marker_pos)
+                if line_start != -1:
+                    end = line_start + 1
+                else:
+                    end = page_marker_pos
+            else:
+                # Look for paragraph, sentence, or space to break on
+                for break_char in ['\n\n', '\n', '.', '!', '?', ' ']:
+                    # Find the last occurrence of the break character in our range
+                    break_pos = text.rfind(break_char, start, end)
+                    if break_pos != -1:
+                        end = break_pos + 1  # +1 to include the break character
+                        break
+        
+        # Add chunk to our list
+        chunks.append(text[start:end])
+        
+        # Set new start position with overlap
+        start = end - overlap if end < len(text) else end
+    
+    return chunks
+
+def generate_embeddings(azure_client, texts):
+    """
+    Generate embeddings for a list of texts
+    """
+    try:
+        response = azure_client.embeddings.create(
+            input=texts,
+            model=AZURE_OPENAI_DEPLOYMENT_NAME
+        )
+        return [item.embedding for item in response.data]
+    except Exception as e:
+        print(f"Error generating embeddings: {e}")
+        return None
+
+def get_pdf_metadata(file_path):
+    """
+    Extract metadata from PDF file if possible
+    """
+    try:
+        import PyPDF2
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            metadata = reader.metadata
+            
+            if metadata:
+                # Convert PDF metadata to dict, filtering out None values
+                meta_dict = {}
+                for key in metadata:
+                    if metadata[key]:
+                        # Remove the leading slash that PyPDF2 might include
+                        clean_key = key[1:] if key.startswith('/') else key
+                        meta_dict[clean_key] = str(metadata[key])
+                return meta_dict
+            return {}
+    except:
+        return {}
+
+def process_and_upload_pdfs():
+    # Initialize clients
+    azure_client = AzureOpenAI(
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT
+    )
+    
+    qdrant_client = QdrantClient(
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY
+    )
+    
+    # Set up the collection
+    setup_collection(qdrant_client)
+    
+    # Get all PDF files in the content directory
+    pdf_files = glob.glob(os.path.join(CONTENT_DIR, "**/*.pdf"), recursive=True)
+    
+    if not pdf_files:
+        print(f"No PDF files found in {CONTENT_DIR}")
+        return
+    
+    print(f"Found {len(pdf_files)} PDF files to process")
+    
+    # Process PDF files
+    all_chunks = []
+    for file_path in tqdm(pdf_files, desc="Processing PDF files"):
+        # Extract text from PDF
+        text = extract_text_from_pdf(file_path)
+        if not text:
+            print(f"Could not extract text from {file_path}. Skipping.")
+            continue
+        
+        # Get PDF metadata
+        pdf_metadata = get_pdf_metadata(file_path)
+        
+        # Split text into chunks
+        chunks = chunk_text(text)
+        print(f"Split {os.path.basename(file_path)} into {len(chunks)} chunks")
+        
+        for chunk_idx, chunk in enumerate(chunks):
+            # Create a deterministic ID from file path and chunk index
+            chunk_id = hashlib.md5(f"{file_path}:{chunk_idx}".encode()).hexdigest()
+            
+            all_chunks.append({
+                "id": chunk_id,
+                "text": chunk,
+                "metadata": {
+                    "source": file_path,
+                    "chunk_index": chunk_idx,
+                    "total_chunks": len(chunks),
+                    "filename": os.path.basename(file_path),
+                    "file_size_bytes": os.path.getsize(file_path),
+                    "pdf_metadata": pdf_metadata
+                }
+            })
+    
+    print(f"Created {len(all_chunks)} chunks from {len(pdf_files)} PDF files")
+    
+    # Upload chunks in batches
+    for i in range(0, len(all_chunks), BATCH_SIZE):
+        batch = all_chunks[i:i+BATCH_SIZE]
+        batch_texts = [item["text"] for item in batch]
+        
+        print(f"Generating embeddings for batch {i//BATCH_SIZE + 1}/{(len(all_chunks)-1)//BATCH_SIZE + 1}")
+        embeddings = generate_embeddings(azure_client, batch_texts)
+        
+        if not embeddings:
+            print(f"Failed to generate embeddings for batch. Skipping.")
+            continue
+        
+        # Prepare points for Qdrant
+        points = []
+        for j, (item, embedding) in enumerate(zip(batch, embeddings)):
+            points.append(PointStruct(
+                id=item["id"],
+                vector=embedding,
+                payload={
+                    "text": item["text"],
+                    **item["metadata"]
+                }
+            ))
+        
+        # Upload to Qdrant
+        try:
+            qdrant_client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points
+            )
+            print(f"Uploaded batch {i//BATCH_SIZE + 1}, {len(points)} chunks to Qdrant")
+        except Exception as e:
+            print(f"Error uploading batch to Qdrant: {e}")
+    
+    # Get collection info
+    collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+    print(f"\nUpload complete. Collection '{COLLECTION_NAME}' now has {collection_info.vectors_count} vectors.")
+
+if __name__ == "__main__":
+    # Create content directory if it doesn't exist
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    
+    # Check if PyPDF2 is installed
+    try:
+        import PyPDF2
+    except ImportError:
+        print("PyPDF2 is required but not installed. Installing now...")
+        import subprocess
+        subprocess.check_call(["pip", "install", "PyPDF2"])
+        print("PyPDF2 installed successfully.")
+    
+    # Run the process
+    process_and_upload_pdfs()
