@@ -1,18 +1,13 @@
 import os
 import numpy as np
-import traceback
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from openai import AzureOpenAI
+from qdrant_client.models import VectorParams, Distance, PointStruct
+from transformers import AutoTokenizer, AutoModel
+import torch
 
 # Load environment variables
 load_dotenv()
-
-# Azure OpenAI credentials
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
 
 # Qdrant connection details
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -21,222 +16,109 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 # Collection name
 COLLECTION_NAME = "document_collection"
 
-def check_environment_variables():
-    """Check if all required environment variables are set"""
-    print("\nChecking environment variables...")
-    env_vars = {
-        "AZURE_OPENAI_ENDPOINT": AZURE_OPENAI_ENDPOINT,
-        "AZURE_OPENAI_API_KEY": AZURE_OPENAI_API_KEY,
-        "AZURE_OPENAI_DEPLOYMENT_NAME": AZURE_OPENAI_DEPLOYMENT_NAME,
-        "AZURE_OPENAI_API_VERSION": AZURE_OPENAI_API_VERSION,
-        "QDRANT_URL": QDRANT_URL,
-        "QDRANT_API_KEY": QDRANT_API_KEY
-    }
-    
-    all_vars_set = True
-    for name, value in env_vars.items():
-        if not value:
-            print(f"❌ Missing environment variable: {name}")
-            all_vars_set = False
+# Hugging Face model settings
+# Using all-MiniLM-L6-v2 which is a good balance of performance and speed (384 dimensions)
+HF_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+def setup_collection(client, vector_size=384):
+    """
+    Create or recreate the collection with the specified vector size
+    """
+    # Check if collection exists
+    if client.collection_exists(COLLECTION_NAME):
+        print(f"Collection '{COLLECTION_NAME}' already exists. Recreate? (y/n)")
+        choice = input().lower()
+        if choice == 'y':
+            client.delete_collection(COLLECTION_NAME)
+            print(f"Collection '{COLLECTION_NAME}' deleted.")
         else:
-            # Mask API keys for security
-            masked = value[:5] + "..." if name.endswith("_KEY") else value
-            print(f"✅ {name}: {masked}")
+            print(f"Using existing collection '{COLLECTION_NAME}'.")
+            return
     
-    return all_vars_set
+    # Create collection with the 384 dimensions for the Hugging Face model
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+    )
+    print(f"Collection '{COLLECTION_NAME}' created with vector size {vector_size}.")
 
-def test_connections():
-    """Test connections to Azure OpenAI and Qdrant"""
-    print("\nTesting connections...")
-    
-    # Test Azure OpenAI
-    try:
-        azure_client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT
-        )
-        
-        # Test embedding generation with a simple string
-        response = azure_client.embeddings.create(
-            input="Test connection",
-            model=AZURE_OPENAI_DEPLOYMENT_NAME
-        )
-        print(f"✅ Azure OpenAI connection successful. Vector dimension: {len(response.data[0].embedding)}")
-    except Exception as e:
-        print(f"❌ Azure OpenAI connection failed: {e}")
-        traceback.print_exc()
-        return False
-    
-    # Test Qdrant
-    try:
-        qdrant_client = QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY
-        )
-        
-        # Check if collection exists
-        collections = qdrant_client.get_collections()
-        collection_names = [collection.name for collection in collections.collections]
-        
-        if COLLECTION_NAME in collection_names:
-            collection_info = qdrant_client.get_collection(COLLECTION_NAME)
-            print(f"✅ Qdrant connection successful. Collection '{COLLECTION_NAME}' exists with {collection_info.config.params.vectors.size} dimensions")
-        else:
-            print(f"⚠️ Qdrant connection successful but collection '{COLLECTION_NAME}' not found")
-            print(f"Available collections: {collection_names}")
-    except Exception as e:
-        print(f"❌ Qdrant connection failed: {e}")
-        traceback.print_exc()
-        return False
-    
-    return True
+# Mean Pooling function to convert token embeddings to sentence embedding
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
-def validate_collection():
-    """Validate that the collection exists and has the expected structure"""
-    print("\nValidating collection...")
-    try:
-        qdrant_client = QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY
-        )
+class HuggingFaceEmbedder:
+    def __init__(self, model_name):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        # Move model to GPU if available
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        print(f"Using device: {self.device}")
+    
+    def generate_embeddings(self, texts):
+        """
+        Generate embeddings for a list of texts using the Hugging Face model
+        """
+        # Tokenize sentences
+        encoded_input = self.tokenizer(
+            texts, 
+            padding=True, 
+            truncation=True, 
+            max_length=512, 
+            return_tensors='pt'
+        ).to(self.device)
         
-        # Check if collection exists
-        collections = qdrant_client.get_collections()
-        collection_names = [collection.name for collection in collections.collections]
+        # Compute token embeddings
+        with torch.no_grad():
+            model_output = self.model(**encoded_input)
         
-        if COLLECTION_NAME not in collection_names:
-            print(f"❌ Collection '{COLLECTION_NAME}' does not exist")
-            print(f"Available collections: {collection_names}")
-            return False
-            
-        # Check collection structure
-        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
-        vector_size = collection_info.config.params.vectors.size
-        print(f"Collection vector size: {vector_size}")
+        # Perform pooling
+        embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
         
-        # Get a sample point to check payload structure
-        sample_points = qdrant_client.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=1,
-            with_payload=True
-        )
+        # Normalize embeddings
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         
-        if not sample_points.points:
-            print("⚠️ Collection exists but appears to be empty")
-            return True
-            
-        sample_payload = sample_points.points[0].payload
-        print(f"Sample payload keys: {list(sample_payload.keys())}")
-        
-        # Check for required fields
-        if "text" not in sample_payload:
-            print("⚠️ Expected 'text' field missing from payload")
-            
-        return True
-        
-    except Exception as e:
-        print(f"❌ Collection validation failed: {e}")
-        traceback.print_exc()
-        return False
+        # Convert to numpy and then to list format
+        return embeddings.cpu().numpy().tolist()
 
-def search_documents(query_text, limit=5, verbose=True):
+def search_documents(query_text, embedder, limit=5):
     """
     Search documents in Qdrant that are relevant to the query
     """
-    def log(message):
-        if verbose:
-            print(message)
-            
     try:
-        log(f"\nStarting search for: '{query_text}'")
-        
-        # Initialize Azure OpenAI client
-        try:
-            azure_client = AzureOpenAI(
-                api_key=AZURE_OPENAI_API_KEY,
-                api_version=AZURE_OPENAI_API_VERSION,
-                azure_endpoint=AZURE_OPENAI_ENDPOINT
-            )
-            log("Azure OpenAI client initialized")
-        except Exception as e:
-            log(f"❌ Failed to initialize Azure OpenAI client: {e}")
-            raise
-        
         # Initialize Qdrant client
-        try:
-            qdrant_client = QdrantClient(
-                url=QDRANT_URL,
-                api_key=QDRANT_API_KEY
-            )
-            log("Qdrant client initialized")
-        except Exception as e:
-            log(f"❌ Failed to initialize Qdrant client: {e}")
-            raise
+        qdrant_client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY
+        )
         
         # Get collection info to check vector dimensions
-        try:
-            collection_info = qdrant_client.get_collection(COLLECTION_NAME)
-            expected_dim = collection_info.config.params.vectors.size
-            log(f"Collection info retrieved: {expected_dim}-dimensional vectors")
-        except Exception as e:
-            log(f"❌ Failed to get collection info: {e}")
-            raise
+        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+        expected_dim = collection_info.config.params.vectors.size
+        print(f"Qdrant collection expects {expected_dim}-dimensional vectors")
         
-        # Generate embedding for the query using Azure OpenAI
-        try:
-            response = azure_client.embeddings.create(
-                input=query_text,
-                model=AZURE_OPENAI_DEPLOYMENT_NAME
-            )
-            original_vector = response.data[0].embedding
-            log(f"Embedding generated with {len(original_vector)} dimensions")
-        except Exception as e:
-            log(f"❌ Failed to generate embedding: {e}")
-            raise
+        # Generate embedding for the query using Hugging Face model
+        query_vector = embedder.generate_embeddings([query_text])[0]
+        print(f"Generated embedding with {len(query_vector)} dimensions")
         
-        # Handle dimension mismatch
-        if len(original_vector) != expected_dim:
-            log(f"⚠️ DIMENSION MISMATCH: Azure OpenAI returns {len(original_vector)}-dim vectors but Qdrant expects {expected_dim}-dim")
-            log("Applying dimension adjustment...")
-            
-            if len(original_vector) > expected_dim:
-                log(f"Method: Truncating vector (taking first {expected_dim} elements)")
-                query_vector = original_vector[:expected_dim]
+        # Handle dimension mismatch if necessary
+        if len(query_vector) != expected_dim:
+            print(f"Resizing vector from {len(query_vector)} to {expected_dim} dimensions")
+            if len(query_vector) > expected_dim:
+                query_vector = query_vector[:expected_dim]
             else:
-                log(f"Method: Padding vector with {expected_dim - len(original_vector)} zeros")
-                query_vector = original_vector + [0] * (expected_dim - len(original_vector))
-                
-            log(f"Adjusted vector size: {len(query_vector)}")
-        else:
-            log("✅ Vector dimensions match between Azure OpenAI and Qdrant")
-            query_vector = original_vector
+                query_vector = query_vector + [0] * (expected_dim - len(query_vector))
         
         # Search Qdrant for similar documents
-        try:
-            log(f"Executing search with vector of size {len(query_vector)}")
-            log(f"Query vector sample: {query_vector[:5]}...")
-            
-            search_results = qdrant_client.search(
-                collection_name=COLLECTION_NAME,
-                query_vector=query_vector,
-                limit=limit,
-                with_payload=True,
-                score_threshold=0.5  # Lowered threshold due to dimension adjustment
-            )
-            
-            log(f"Search completed, found {len(search_results)} results")
-            
-            # Inspect what the search returns
-            if search_results and verbose:
-                log(f"First result score: {search_results[0].score}")
-                log(f"Payload keys: {list(search_results[0].payload.keys())}")
-            elif verbose:
-                log("No search results returned")
-                
-        except Exception as e:
-            log(f"❌ Search execution failed: {e}")
-            raise
+        search_results = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=limit,
+            with_payload=True,
+            score_threshold=0.6  # Adjusted threshold for Hugging Face models
+        )
         
         # Format and return results
         results = []
@@ -253,205 +135,149 @@ def search_documents(query_text, limit=5, verbose=True):
         return results
     
     except Exception as e:
-        log(f"❌ Overall search error: {type(e).__name__}: {e}")
-        if verbose:
-            traceback.print_exc()
+        print(f"Error searching documents: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
-def integration_test():
-    """Perform a simple end-to-end test"""
-    print("\nRunning integration test...")
-    
-    test_queries = [
-        "A simple test query",
-        "Something more complex about machine learning"
-    ]
-    
-    for query in test_queries:
-        print(f"\nTesting query: '{query}'")
-        results = search_documents(query, limit=1)
-        
-        if results:
-            print("✅ Got result with score:", results[0]["score"])
-            print(f"Document excerpt: {results[0]['document'][:100]}...")
-        else:
-            print("❌ No results returned")
-    
-    print("\nIntegration test complete")
-
-def debug_system():
-    """Run a complete system debug"""
-    print("="*50)
-    print("SYSTEM DEBUGGING")
-    print("="*50)
-    
-    # 1. Check environment variables
-    env_vars_ok = check_environment_variables()
-    if not env_vars_ok:
-        print("\n❌ Environment variables missing. Please check your .env file")
-        return False
-    
-    # 2. Test connections
-    connections_ok = test_connections()
-    if not connections_ok:
-        print("\n❌ Connection tests failed. Please check your credentials and network")
-        return False
-    
-    # 3. Validate collection
-    collection_ok = validate_collection()
-    if not collection_ok:
-        print("\n❌ Collection validation failed")
-        return False
-    
-    # 4. Test search with simple query
-    print("\n4. Testing search with simple query...")
-    results = search_documents("test query", limit=2)
-    
-    print("\n5. Debug summary:")
-    if results:
-        print("✅ System appears to be working correctly!")
-    else:
-        print("⚠️ System may have issues - no results returned for test query")
-    
-    print("="*50)
-    return True
-
-def fix_dimension_issue():
-    """Utility to create a new collection with correct dimensions"""
-    print("\nFix Dimension Issue Utility")
-    
+def process_pdf_with_hf_embeddings(file_path, embedder):
+    """Process a single PDF and upload embeddings to Qdrant"""
     try:
-        # Get current dimensions from Azure OpenAI
-        azure_client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT
-        )
+        import PyPDF2
         
-        response = azure_client.embeddings.create(
-            input="Dimension test",
-            model=AZURE_OPENAI_DEPLOYMENT_NAME
-        )
-        correct_dim = len(response.data[0].embedding)
-        print(f"Azure OpenAI generates {correct_dim}-dimensional vectors")
-        
-        # Connect to Qdrant
+        # Initialize Qdrant client
         qdrant_client = QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY
         )
         
-        # Check if collection exists
-        collections = qdrant_client.get_collections()
-        collection_names = [collection.name for collection in collections.collections]
+        # Create collection if it doesn't exist
+        setup_collection(qdrant_client)
         
-        if COLLECTION_NAME in collection_names:
-            current_info = qdrant_client.get_collection(COLLECTION_NAME)
-            current_dim = current_info.config.params.vectors.size
+        # Extract text from PDF
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            total_pages = len(reader.pages)
+            print(f"Processing PDF: {os.path.basename(file_path)} - {total_pages} pages")
             
-            if current_dim == correct_dim:
-                print(f"✅ Collection already has correct dimensions: {current_dim}")
-                return True
+            # Extract text by pages
+            chunks = []
+            for i, page in enumerate(reader.pages):
+                page_text = page.extract_text()
+                if page_text and len(page_text.strip()) > 0:
+                    chunks.append({
+                        "text": f"Page {i+1}: {page_text}",
+                        "metadata": {
+                            "source": file_path,
+                            "page": i+1,
+                            "total_pages": total_pages,
+                            "filename": os.path.basename(file_path)
+                        }
+                    })
+            
+            if not chunks:
+                print(f"No text extracted from {file_path}")
+                return
+            
+            print(f"Extracted {len(chunks)} text chunks from PDF")
+            
+            # Generate embeddings in batches
+            BATCH_SIZE = 8  # Smaller batch size for memory efficiency
+            
+            for i in range(0, len(chunks), BATCH_SIZE):
+                batch = chunks[i:i+BATCH_SIZE]
+                texts = [item["text"] for item in batch]
                 
-            print(f"⚠️ Current collection has {current_dim} dimensions but should have {correct_dim}")
-            
-            # Offer to recreate
-            confirm = input(f"Do you want to recreate the collection with {correct_dim} dimensions? (y/N): ")
-            if confirm.lower() != 'y':
-                print("Operation cancelled")
-                return False
+                print(f"Generating embeddings for batch {i//BATCH_SIZE + 1}/{(len(chunks)-1)//BATCH_SIZE + 1}")
+                batch_embeddings = embedder.generate_embeddings(texts)
                 
-            # Create new collection name
-            new_collection = f"{COLLECTION_NAME}_new"
-            print(f"Creating new collection: {new_collection}")
-            
-            # Create new collection
-            qdrant_client.recreate_collection(
-                collection_name=new_collection,
-                vectors_config={
-                    "size": correct_dim,
-                    "distance": "Cosine" 
-                }
-            )
-            
-            print(f"✅ Created new collection '{new_collection}' with {correct_dim} dimensions")
-            print(f"You will need to re-index your documents into the new collection")
-            print(f"Then update your COLLECTION_NAME variable to '{new_collection}'")
-            
-        else:
-            print(f"Collection '{COLLECTION_NAME}' doesn't exist yet")
-            
-            # Create new collection
-            qdrant_client.recreate_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config={
-                    "size": correct_dim,
-                    "distance": "Cosine" 
-                }
-            )
-            
-            print(f"✅ Created collection '{COLLECTION_NAME}' with {correct_dim} dimensions")
-            
-        return True
+                # Prepare points for Qdrant
+                points = []
+                for j, (item, embedding) in enumerate(zip(batch, batch_embeddings)):
+                    # Generate a stable ID based on content
+                    point_id = f"{os.path.basename(file_path)}-page-{item['metadata']['page']}"
+                    point_id = point_id.encode('utf-8')
+                    import hashlib
+                    point_id_hash = hashlib.md5(point_id).hexdigest()
+                    
+                    points.append(PointStruct(
+                        id=point_id_hash,
+                        vector=embedding,
+                        payload={
+                            "text": item["text"],
+                            **item["metadata"]
+                        }
+                    ))
+                
+                # Upload to Qdrant
+                try:
+                    qdrant_client.upsert(
+                        collection_name=COLLECTION_NAME,
+                        points=points
+                    )
+                    print(f"Uploaded batch {i//BATCH_SIZE + 1}, {len(points)} chunks to Qdrant")
+                except Exception as e:
+                    print(f"Error uploading batch to Qdrant: {e}")
         
+        # Get collection info
+        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+        print(f"\nUpload complete. Collection '{COLLECTION_NAME}' now has {collection_info.vectors_count} vectors.")
+            
     except Exception as e:
-        print(f"❌ Failed to fix dimension issue: {e}")
+        print(f"Error processing PDF: {e}")
+        import traceback
         traceback.print_exc()
-        return False
 
 def main():
-    """Main function"""
-    print("\n🔍 QDRANT VECTOR SEARCH UTILITY 🔍")
-    print("="*40)
+    print("Select an option:")
+    print("1. Upload a PDF document")
+    print("2. Search documents")
+    choice = input("Enter choice (1 or 2): ")
     
-    print("\nSelect mode:")
-    print("1. Run system debug")
-    print("2. Run integration test")
-    print("3. Fix dimension issues")
-    print("4. Normal search mode")
-    print("5. Exit")
+    # Initialize the embedder
+    print(f"Loading Hugging Face model: {HF_MODEL_NAME}...")
+    embedder = HuggingFaceEmbedder(HF_MODEL_NAME)
+    print("Model loaded successfully.")
     
-    choice = input("\nEnter choice (1-5): ")
+    if choice == '1':
+        # Option to upload a PDF
+        pdf_path = input("Enter the path to the PDF file: ")
+        if os.path.exists(pdf_path) and pdf_path.lower().endswith('.pdf'):
+            process_pdf_with_hf_embeddings(pdf_path, embedder)
+        else:
+            print("Invalid PDF path or file is not a PDF.")
     
-    if choice == "1":
-        debug_system()
-    elif choice == "2":
-        integration_test()
-    elif choice == "3":
-        fix_dimension_issue()
-    elif choice == "4":
-        # Check environment variables first
-        if not check_environment_variables():
-            print("\n❌ Environment variables missing. Please check your .env file")
-            return
-            
-        user_query = input("\nEnter your query: ")
+    elif choice == '2':
+        # Option to search
+        user_query = input("Enter your query: ")
         print(f"\nSearching for documents relevant to: '{user_query}'")
         
-        results = search_documents(user_query)
+        results = search_documents(user_query, embedder)
         
         if not results:
-            print("\nNo relevant documents found.")
+            print("No relevant documents found.")
         else:
             print("\nFound the following relevant documents:")
             for i, result in enumerate(results, 1):
                 print(f"\n--- Result {i} (Relevance Score: {result['score']:.4f}) ---")
-                # Print only first 200 characters if document is long
-                doc_text = result['document']
-                if len(doc_text) > 200:
-                    print(f"Document: {doc_text[:200]}...")
-                    print(f"(Document length: {len(doc_text)} characters)")
-                else:
-                    print(f"Document: {doc_text}")
-                    
+                print(f"Document: {result['document'][:200]}...")
                 if result['metadata']:
                     print("Metadata:")
                     for key, value in result['metadata'].items():
-                        print(f"  - {key}: {value}")
-    elif choice == "5":
-        print("Exiting...")
+                        if key != "text":
+                            print(f"  - {key}: {value}")
+    
     else:
-        print("Invalid choice. Please try again.")
+        print("Invalid choice.")
 
 if __name__ == "__main__":
+    # Install required packages if missing
+    try:
+        import transformers
+    except ImportError:
+        print("Installing required packages...")
+        import subprocess
+        subprocess.check_call(["pip", "install", "transformers", "torch", "sentence-transformers", "PyPDF2"])
+        print("Packages installed.")
+    
     main()
