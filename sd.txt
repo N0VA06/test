@@ -1,13 +1,18 @@
 import os
-import sys
+import numpy as np
+import traceback
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as rest
-import requests
-import time
+from openai import AzureOpenAI
 
 # Load environment variables
 load_dotenv()
+
+# Azure OpenAI credentials
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
 
 # Qdrant connection details
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -16,180 +21,437 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 # Collection name
 COLLECTION_NAME = "document_collection"
 
-def test_connection():
-    """
-    Test the connection to Qdrant and diagnose any issues
-    """
-    print("\n=== Qdrant Connection Diagnostics ===\n")
+def check_environment_variables():
+    """Check if all required environment variables are set"""
+    print("\nChecking environment variables...")
+    env_vars = {
+        "AZURE_OPENAI_ENDPOINT": AZURE_OPENAI_ENDPOINT,
+        "AZURE_OPENAI_API_KEY": AZURE_OPENAI_API_KEY,
+        "AZURE_OPENAI_DEPLOYMENT_NAME": AZURE_OPENAI_DEPLOYMENT_NAME,
+        "AZURE_OPENAI_API_VERSION": AZURE_OPENAI_API_VERSION,
+        "QDRANT_URL": QDRANT_URL,
+        "QDRANT_API_KEY": QDRANT_API_KEY
+    }
     
-    # Check if environment variables are set
-    print("Checking environment variables...")
-    if not QDRANT_URL:
-        print("❌ QDRANT_URL is not set in your .env file")
-        print("   Please add QDRANT_URL=your_qdrant_url to your .env file")
-        return False
-    else:
-        print(f"✓ QDRANT_URL is set to: {QDRANT_URL}")
-    
-    if not QDRANT_API_KEY and "qdrant.cloud" in QDRANT_URL:
-        print("⚠️ QDRANT_API_KEY is not set, but you're using Qdrant Cloud")
-        print("   This might cause authentication issues")
-    elif QDRANT_API_KEY:
-        print("✓ QDRANT_API_KEY is set")
-    
-    # Try a simple HTTP request first
-    print("\nTesting basic HTTP connectivity...")
-    try:
-        # Strip API path if present
-        base_url = QDRANT_URL
-        if base_url.endswith('/'):
-            base_url = base_url[:-1]
-            
-        # Remove API version paths if present
-        if "/v1" in base_url:
-            base_url = base_url.split("/v1")[0]
-            
-        health_url = f"{base_url}/health"
-        
-        headers = {}
-        if QDRANT_API_KEY:
-            headers["api-key"] = QDRANT_API_KEY
-        
-        response = requests.get(health_url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            print(f"✓ Basic HTTP connection successful (status: {response.status_code})")
-            print(f"✓ Server responded: {response.json()}")
+    all_vars_set = True
+    for name, value in env_vars.items():
+        if not value:
+            print(f"❌ Missing environment variable: {name}")
+            all_vars_set = False
         else:
-            print(f"⚠️ Server responded with status code: {response.status_code}")
-            print(f"   Response: {response.text}")
-    except requests.exceptions.RequestException as e:
-        print(f"❌ HTTP connection failed: {e}")
-        print("\nPossible solutions:")
-        print("1. Check if the Qdrant server is running")
-        print("2. Verify the URL is correct (should include http:// or https://)")
-        print("3. Check your network connection and firewall settings")
-        print("4. If using Qdrant Cloud, make sure your API key is correct")
+            # Mask API keys for security
+            masked = value[:5] + "..." if name.endswith("_KEY") else value
+            print(f"✅ {name}: {masked}")
+    
+    return all_vars_set
+
+def test_connections():
+    """Test connections to Azure OpenAI and Qdrant"""
+    print("\nTesting connections...")
+    
+    # Test Azure OpenAI
+    try:
+        azure_client = AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT
+        )
+        
+        # Test embedding generation with a simple string
+        response = azure_client.embeddings.create(
+            input="Test connection",
+            model=AZURE_OPENAI_DEPLOYMENT_NAME
+        )
+        print(f"✅ Azure OpenAI connection successful. Vector dimension: {len(response.data[0].embedding)}")
+    except Exception as e:
+        print(f"❌ Azure OpenAI connection failed: {e}")
+        traceback.print_exc()
         return False
     
-    # Try connecting with the Qdrant client
-    print("\nTesting Qdrant client connection...")
+    # Test Qdrant
     try:
-        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
-        client_info = client.get_cluster_info()
-        print(f"✓ Qdrant client connection successful!")
-        print(f"✓ Connected to Qdrant version: {client_info.version}")
+        qdrant_client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY
+        )
         
-        # Check if our collection exists
-        print(f"\nChecking if collection '{COLLECTION_NAME}' exists...")
-        if client.collection_exists(COLLECTION_NAME):
-            print(f"✓ Collection '{COLLECTION_NAME}' exists")
-            
-            # Get collection info
-            collection_info = client.get_collection(COLLECTION_NAME)
-            print(f"✓ Collection has {collection_info.vectors_count} vectors")
-            print(f"✓ Vector size: {collection_info.config.params.vectors.size}")
-            
-            # Test a simple search
-            print("\nTesting a simple search...")
-            # Generate a random vector of the right size
-            import random
-            vector_size = collection_info.config.params.vectors.size
-            random_vector = [random.random() for _ in range(vector_size)]
-            
-            # Search
-            search_results = client.search(
-                collection_name=COLLECTION_NAME,
-                query_vector=random_vector,
-                limit=1
-            )
-            
-            if search_results:
-                print(f"✓ Search successful, found {len(search_results)} results")
-                return True
-            else:
-                print("⚠️ Search returned no results (this might be normal for a random vector)")
-                return True
+        # Check if collection exists
+        collections = qdrant_client.get_collections()
+        collection_names = [collection.name for collection in collections.collections]
+        
+        if COLLECTION_NAME in collection_names:
+            collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+            print(f"✅ Qdrant connection successful. Collection '{COLLECTION_NAME}' exists with {collection_info.config.params.vectors.size} dimensions")
         else:
+            print(f"⚠️ Qdrant connection successful but collection '{COLLECTION_NAME}' not found")
+            print(f"Available collections: {collection_names}")
+    except Exception as e:
+        print(f"❌ Qdrant connection failed: {e}")
+        traceback.print_exc()
+        return False
+    
+    return True
+
+def validate_collection():
+    """Validate that the collection exists and has the expected structure"""
+    print("\nValidating collection...")
+    try:
+        qdrant_client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY
+        )
+        
+        # Check if collection exists
+        collections = qdrant_client.get_collections()
+        collection_names = [collection.name for collection in collections.collections]
+        
+        if COLLECTION_NAME not in collection_names:
             print(f"❌ Collection '{COLLECTION_NAME}' does not exist")
-            print("You need to create and populate the collection first")
+            print(f"Available collections: {collection_names}")
             return False
             
+        # Check collection structure
+        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+        vector_size = collection_info.config.params.vectors.size
+        print(f"Collection vector size: {vector_size}")
+        
+        # Get a sample point to check payload structure
+        sample_points = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=1,
+            with_payload=True
+        )
+        
+        if not sample_points.points:
+            print("⚠️ Collection exists but appears to be empty")
+            return True
+            
+        sample_payload = sample_points.points[0].payload
+        print(f"Sample payload keys: {list(sample_payload.keys())}")
+        
+        # Check for required fields
+        if "text" not in sample_payload:
+            print("⚠️ Expected 'text' field missing from payload")
+            
+        return True
+        
     except Exception as e:
-        print(f"❌ Qdrant client connection failed: {e}")
-        print("\nPossible solutions:")
-        print("1. Check if the Qdrant server is running")
-        print("2. Verify the URL is correct")
-        print("3. If using Qdrant Cloud, make sure your API key is correct")
-        print("4. Check if your collection has been created")
+        print(f"❌ Collection validation failed: {e}")
+        traceback.print_exc()
         return False
 
-def fix_common_issues():
-    """Attempt to fix common issues"""
-    print("\n=== Attempting to fix common issues ===\n")
-    
-    fixed = False
-    
-    # Fix 1: Try to create the collection if it doesn't exist
-    try:
-        print("Attempting to create the collection...")
-        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
-        
-        if not client.collection_exists(COLLECTION_NAME):
-            from qdrant_client.models import VectorParams, Distance
-            client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
-            )
-            print(f"✓ Created collection '{COLLECTION_NAME}'")
-            fixed = True
-        else:
-            print(f"Collection '{COLLECTION_NAME}' already exists")
+def search_documents(query_text, limit=5, verbose=True):
+    """
+    Search documents in Qdrant that are relevant to the query
+    """
+    def log(message):
+        if verbose:
+            print(message)
             
-    except Exception as e:
-        print(f"❌ Failed to create collection: {e}")
+    try:
+        log(f"\nStarting search for: '{query_text}'")
+        
+        # Initialize Azure OpenAI client
+        try:
+            azure_client = AzureOpenAI(
+                api_key=AZURE_OPENAI_API_KEY,
+                api_version=AZURE_OPENAI_API_VERSION,
+                azure_endpoint=AZURE_OPENAI_ENDPOINT
+            )
+            log("Azure OpenAI client initialized")
+        except Exception as e:
+            log(f"❌ Failed to initialize Azure OpenAI client: {e}")
+            raise
+        
+        # Initialize Qdrant client
+        try:
+            qdrant_client = QdrantClient(
+                url=QDRANT_URL,
+                api_key=QDRANT_API_KEY
+            )
+            log("Qdrant client initialized")
+        except Exception as e:
+            log(f"❌ Failed to initialize Qdrant client: {e}")
+            raise
+        
+        # Get collection info to check vector dimensions
+        try:
+            collection_info = qdrant_client.get_collection(COLLECTION_NAME)
+            expected_dim = collection_info.config.params.vectors.size
+            log(f"Collection info retrieved: {expected_dim}-dimensional vectors")
+        except Exception as e:
+            log(f"❌ Failed to get collection info: {e}")
+            raise
+        
+        # Generate embedding for the query using Azure OpenAI
+        try:
+            response = azure_client.embeddings.create(
+                input=query_text,
+                model=AZURE_OPENAI_DEPLOYMENT_NAME
+            )
+            original_vector = response.data[0].embedding
+            log(f"Embedding generated with {len(original_vector)} dimensions")
+        except Exception as e:
+            log(f"❌ Failed to generate embedding: {e}")
+            raise
+        
+        # Handle dimension mismatch
+        if len(original_vector) != expected_dim:
+            log(f"⚠️ DIMENSION MISMATCH: Azure OpenAI returns {len(original_vector)}-dim vectors but Qdrant expects {expected_dim}-dim")
+            log("Applying dimension adjustment...")
+            
+            if len(original_vector) > expected_dim:
+                log(f"Method: Truncating vector (taking first {expected_dim} elements)")
+                query_vector = original_vector[:expected_dim]
+            else:
+                log(f"Method: Padding vector with {expected_dim - len(original_vector)} zeros")
+                query_vector = original_vector + [0] * (expected_dim - len(original_vector))
+                
+            log(f"Adjusted vector size: {len(query_vector)}")
+        else:
+            log("✅ Vector dimensions match between Azure OpenAI and Qdrant")
+            query_vector = original_vector
+        
+        # Search Qdrant for similar documents
+        try:
+            log(f"Executing search with vector of size {len(query_vector)}")
+            log(f"Query vector sample: {query_vector[:5]}...")
+            
+            search_results = qdrant_client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+                score_threshold=0.5  # Lowered threshold due to dimension adjustment
+            )
+            
+            log(f"Search completed, found {len(search_results)} results")
+            
+            # Inspect what the search returns
+            if search_results and verbose:
+                log(f"First result score: {search_results[0].score}")
+                log(f"Payload keys: {list(search_results[0].payload.keys())}")
+            elif verbose:
+                log("No search results returned")
+                
+        except Exception as e:
+            log(f"❌ Search execution failed: {e}")
+            raise
+        
+        # Format and return results
+        results = []
+        for result in search_results:
+            results.append({
+                "document": result.payload.get("text", "No text available"),
+                "metadata": {
+                    key: value for key, value in result.payload.items() 
+                    if key != "text"
+                },
+                "score": result.score
+            })
+        
+        return results
     
-    return fixed
+    except Exception as e:
+        log(f"❌ Overall search error: {type(e).__name__}: {e}")
+        if verbose:
+            traceback.print_exc()
+        return []
+
+def integration_test():
+    """Perform a simple end-to-end test"""
+    print("\nRunning integration test...")
+    
+    test_queries = [
+        "A simple test query",
+        "Something more complex about machine learning"
+    ]
+    
+    for query in test_queries:
+        print(f"\nTesting query: '{query}'")
+        results = search_documents(query, limit=1)
+        
+        if results:
+            print("✅ Got result with score:", results[0]["score"])
+            print(f"Document excerpt: {results[0]['document'][:100]}...")
+        else:
+            print("❌ No results returned")
+    
+    print("\nIntegration test complete")
+
+def debug_system():
+    """Run a complete system debug"""
+    print("="*50)
+    print("SYSTEM DEBUGGING")
+    print("="*50)
+    
+    # 1. Check environment variables
+    env_vars_ok = check_environment_variables()
+    if not env_vars_ok:
+        print("\n❌ Environment variables missing. Please check your .env file")
+        return False
+    
+    # 2. Test connections
+    connections_ok = test_connections()
+    if not connections_ok:
+        print("\n❌ Connection tests failed. Please check your credentials and network")
+        return False
+    
+    # 3. Validate collection
+    collection_ok = validate_collection()
+    if not collection_ok:
+        print("\n❌ Collection validation failed")
+        return False
+    
+    # 4. Test search with simple query
+    print("\n4. Testing search with simple query...")
+    results = search_documents("test query", limit=2)
+    
+    print("\n5. Debug summary:")
+    if results:
+        print("✅ System appears to be working correctly!")
+    else:
+        print("⚠️ System may have issues - no results returned for test query")
+    
+    print("="*50)
+    return True
+
+def fix_dimension_issue():
+    """Utility to create a new collection with correct dimensions"""
+    print("\nFix Dimension Issue Utility")
+    
+    try:
+        # Get current dimensions from Azure OpenAI
+        azure_client = AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT
+        )
+        
+        response = azure_client.embeddings.create(
+            input="Dimension test",
+            model=AZURE_OPENAI_DEPLOYMENT_NAME
+        )
+        correct_dim = len(response.data[0].embedding)
+        print(f"Azure OpenAI generates {correct_dim}-dimensional vectors")
+        
+        # Connect to Qdrant
+        qdrant_client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY
+        )
+        
+        # Check if collection exists
+        collections = qdrant_client.get_collections()
+        collection_names = [collection.name for collection in collections.collections]
+        
+        if COLLECTION_NAME in collection_names:
+            current_info = qdrant_client.get_collection(COLLECTION_NAME)
+            current_dim = current_info.config.params.vectors.size
+            
+            if current_dim == correct_dim:
+                print(f"✅ Collection already has correct dimensions: {current_dim}")
+                return True
+                
+            print(f"⚠️ Current collection has {current_dim} dimensions but should have {correct_dim}")
+            
+            # Offer to recreate
+            confirm = input(f"Do you want to recreate the collection with {correct_dim} dimensions? (y/N): ")
+            if confirm.lower() != 'y':
+                print("Operation cancelled")
+                return False
+                
+            # Create new collection name
+            new_collection = f"{COLLECTION_NAME}_new"
+            print(f"Creating new collection: {new_collection}")
+            
+            # Create new collection
+            qdrant_client.recreate_collection(
+                collection_name=new_collection,
+                vectors_config={
+                    "size": correct_dim,
+                    "distance": "Cosine" 
+                }
+            )
+            
+            print(f"✅ Created new collection '{new_collection}' with {correct_dim} dimensions")
+            print(f"You will need to re-index your documents into the new collection")
+            print(f"Then update your COLLECTION_NAME variable to '{new_collection}'")
+            
+        else:
+            print(f"Collection '{COLLECTION_NAME}' doesn't exist yet")
+            
+            # Create new collection
+            qdrant_client.recreate_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config={
+                    "size": correct_dim,
+                    "distance": "Cosine" 
+                }
+            )
+            
+            print(f"✅ Created collection '{COLLECTION_NAME}' with {correct_dim} dimensions")
+            
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to fix dimension issue: {e}")
+        traceback.print_exc()
+        return False
 
 def main():
-    """Main function to run the diagnosis"""
-    print("\n==== Qdrant Connection Diagnostic Tool ====")
-    print("This tool will help diagnose connection issues with Qdrant")
+    """Main function"""
+    print("\n🔍 QDRANT VECTOR SEARCH UTILITY 🔍")
+    print("="*40)
     
-    # First test
-    print("\n----- Initial Test -----")
-    if test_connection():
-        print("\n✅ Connection to Qdrant is working correctly!")
-        return
+    print("\nSelect mode:")
+    print("1. Run system debug")
+    print("2. Run integration test")
+    print("3. Fix dimension issues")
+    print("4. Normal search mode")
+    print("5. Exit")
     
-    # Try to fix issues
-    print("\n----- Attempting Fixes -----")
-    if fix_common_issues():
-        # Test again after fixes
-        print("\n----- Testing After Fixes -----")
-        if test_connection():
-            print("\n✅ Issues have been fixed. Connection to Qdrant is now working!")
+    choice = input("\nEnter choice (1-5): ")
+    
+    if choice == "1":
+        debug_system()
+    elif choice == "2":
+        integration_test()
+    elif choice == "3":
+        fix_dimension_issue()
+    elif choice == "4":
+        # Check environment variables first
+        if not check_environment_variables():
+            print("\n❌ Environment variables missing. Please check your .env file")
             return
-    
-    print("\n❌ Connection issues could not be automatically fixed")
-    print("\nManual troubleshooting steps:")
-    print("1. Check your .env file and make sure QDRANT_URL and QDRANT_API_KEY are correct")
-    print("2. For Qdrant Cloud: Verify your API key and collection permissions")
-    print("3. For local Qdrant: Make sure the server is running (docker ps or systemctl status qdrant)")
-    print("4. Check firewall rules and network connectivity")
-    print("5. If running in a container or cloud, check network policies")
-    
-    # Provide env var info for debugging
-    print("\nFor support, here's your (redacted) configuration:")
-    if QDRANT_URL:
-        print(f"QDRANT_URL: {QDRANT_URL}")
+            
+        user_query = input("\nEnter your query: ")
+        print(f"\nSearching for documents relevant to: '{user_query}'")
+        
+        results = search_documents(user_query)
+        
+        if not results:
+            print("\nNo relevant documents found.")
+        else:
+            print("\nFound the following relevant documents:")
+            for i, result in enumerate(results, 1):
+                print(f"\n--- Result {i} (Relevance Score: {result['score']:.4f}) ---")
+                # Print only first 200 characters if document is long
+                doc_text = result['document']
+                if len(doc_text) > 200:
+                    print(f"Document: {doc_text[:200]}...")
+                    print(f"(Document length: {len(doc_text)} characters)")
+                else:
+                    print(f"Document: {doc_text}")
+                    
+                if result['metadata']:
+                    print("Metadata:")
+                    for key, value in result['metadata'].items():
+                        print(f"  - {key}: {value}")
+    elif choice == "5":
+        print("Exiting...")
     else:
-        print("QDRANT_URL: Not set")
-    
-    if QDRANT_API_KEY:
-        masked_key = QDRANT_API_KEY[:4] + "..." + QDRANT_API_KEY[-4:] if len(QDRANT_API_KEY) > 8 else "***"
-        print(f"QDRANT_API_KEY: {masked_key} (redacted)")
-    else:
-        print("QDRANT_API_KEY: Not set")
+        print("Invalid choice. Please try again.")
 
 if __name__ == "__main__":
     main()
