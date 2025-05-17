@@ -1,1 +1,848 @@
+"""
+NFR Test Case Generator System
+------------------------------
+A multi-agent system that specializes in generating detailed test cases for various 
+Non-Functional Requirements (NFRs) using LangChain and Azure OpenAI/OpenAI.
 
+This system includes specialized agents for different NFR domains:
+- Performance
+- Scalability
+- Reliability
+- Usability
+- Security
+
+Each agent is initialized with specific knowledge and context for its domain and 
+generates structured test cases based on NFR descriptions.
+"""
+
+import os
+from typing import Dict, List, Optional, Union, Any
+from enum import Enum
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+import json
+
+from langchain.prompts import PromptTemplate
+from langchain.chat_models import AzureChatOpenAI, ChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.chains import LLMChain
+from langchain.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
+
+# =============================================
+# Configuration 
+# =============================================
+
+class NFRType(str, Enum):
+    """Enum defining different types of Non-Functional Requirements"""
+    PERFORMANCE = "performance"
+    SCALABILITY = "scalability"
+    RELIABILITY = "reliability"
+    USABILITY = "usability"
+    SECURITY = "security"
+    UNKNOWN = "unknown"
+
+@dataclass
+class AzureConfig:
+    """Configuration for Azure OpenAI"""
+    api_key: str
+    api_base: str
+    api_version: str
+    deployment_name: str
+    
+@dataclass
+class OpenAIConfig:
+    """Configuration for OpenAI"""
+    api_key: str
+    model_name: str
+
+@dataclass
+class Config:
+    """System configuration"""
+    provider: str = "azure"  # "azure" or "openai"
+    azure_config: Optional[AzureConfig] = None
+    openai_config: Optional[OpenAIConfig] = None
+
+    @classmethod
+    def from_env(cls) -> 'Config':
+        """Create configuration from environment variables"""
+        provider = os.getenv("LLM_PROVIDER", "azure")
+        
+        if provider.lower() == "azure":
+            return cls(
+                provider="azure",
+                azure_config=AzureConfig(
+                    # Replace with your Azure OpenAI API credentials
+                    api_key=os.getenv("AZURE_OPENAI_API_KEY", "your-azure-openai-api-key"),
+                    api_base=os.getenv("AZURE_OPENAI_API_BASE", "your-azure-openai-endpoint"),
+                    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
+                    deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "your-deployment-name"),
+                )
+            )
+        else:
+            return cls(
+                provider="openai",
+                openai_config=OpenAIConfig(
+                    # Replace with your OpenAI API credentials
+                    api_key=os.getenv("OPENAI_API_KEY", "your-openai-api-key"),
+                    model_name=os.getenv("OPENAI_MODEL_NAME", "gpt-4"),
+                )
+            )
+
+# =============================================
+# Output Models
+# =============================================
+
+class TestCase(BaseModel):
+    """Model for a single test case"""
+    id: str = Field(description="Unique identifier for the test case")
+    title: str = Field(description="Brief title for the test case")
+    description: str = Field(description="Detailed description of what this test case verifies")
+    preconditions: List[str] = Field(description="List of conditions that must be true before executing the test")
+    steps: List[str] = Field(description="Ordered list of steps to execute the test")
+    expected_results: List[str] = Field(description="Expected outcomes from executing the test")
+    test_data: Dict[str, Any] = Field(description="Sample data to use during test execution")
+    evaluation_metrics: Dict[str, str] = Field(description="Metrics to evaluate the test results")
+    priority: str = Field(description="Priority level (High, Medium, Low)")
+    nfr_type: NFRType = Field(description="Type of NFR this test case addresses")
+
+class TestCaseResponse(BaseModel):
+    """Model for the complete response"""
+    test_cases: List[TestCase] = Field(description="Generated test cases")
+    nfr_type: NFRType = Field(description="Type of NFR processed")
+    summary: str = Field(description="Summary of the test cases generated")
+    recommendations: Optional[List[str]] = Field(description="Additional recommendations for testing this NFR")
+
+# =============================================
+# LLM Service
+# =============================================
+
+class LLMService:
+    """Service for interacting with LLMs"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        
+    def get_llm(self):
+        """Initialize and return the appropriate LLM based on configuration"""
+        if self.config.provider == "azure":
+            # Azure OpenAI
+            return AzureChatOpenAI(
+                openai_api_key=self.config.azure_config.api_key,
+                azure_endpoint=self.config.azure_config.api_base,
+                openai_api_version=self.config.azure_config.api_version,
+                deployment_name=self.config.azure_config.deployment_name,
+                temperature=0.2,
+            )
+        else:
+            # OpenAI
+            return ChatOpenAI(
+                api_key=self.config.openai_config.api_key,
+                model_name=self.config.openai_config.model_name,
+                temperature=0.2,
+            )
+
+# =============================================
+# Base Agent
+# =============================================
+
+class NFRAgent(ABC):
+    """Base class for all NFR-specific agents"""
+    
+    def __init__(self, llm_service: LLMService):
+        self.llm = llm_service.get_llm()
+        self.output_parser = PydanticOutputParser(pydantic_object=TestCaseResponse)
+        
+    @property
+    @abstractmethod
+    def nfr_type(self) -> NFRType:
+        """Return the NFR type this agent specializes in"""
+        pass
+    
+    @property
+    @abstractmethod
+    def system_prompt(self) -> str:
+        """Return the system prompt for this agent"""
+        pass
+    
+    def create_prompt(self) -> PromptTemplate:
+        """Create the prompt template for this agent"""
+        template = (
+            self.system_prompt + 
+            "\n\n" +
+            "NFR Description: {nfr_description}\n\n" +
+            "Application Context: {application_context}\n\n" +
+            "Format Instructions: {format_instructions}\n\n" +
+            "Generate detailed test cases for this NFR."
+        )
+        
+        return PromptTemplate(
+            template=template,
+            input_variables=["nfr_description", "application_context"],
+            partial_variables={"format_instructions": self.output_parser.get_format_instructions()},
+        )
+    
+    def generate_test_cases(self, 
+                            nfr_description: str, 
+                            application_context: str) -> TestCaseResponse:
+        """Generate test cases based on the NFR description and application context"""
+        prompt = self.create_prompt()
+        
+        chain = LLMChain(llm=self.llm, prompt=prompt)
+        
+        result = chain.run(
+            nfr_description=nfr_description,
+            application_context=application_context
+        )
+        
+        try:
+            parsed_result = self.output_parser.parse(result)
+            return parsed_result
+        except Exception as e:
+            # Fallback in case parsing fails
+            print(f"Error parsing result: {e}")
+            return TestCaseResponse(
+                test_cases=[],
+                nfr_type=self.nfr_type,
+                summary=f"Error generating structured test cases: {str(e)}",
+                recommendations=["Please try again with a more detailed NFR description."]
+            )
+
+# =============================================
+# Specialized NFR Agents
+# =============================================
+
+class PerformanceAgent(NFRAgent):
+    """Agent specialized in generating performance test cases"""
+    
+    @property
+    def nfr_type(self) -> NFRType:
+        return NFRType.PERFORMANCE
+    
+    @property
+    def system_prompt(self) -> str:
+        return """
+        You are a Performance Testing Expert specializing in generating detailed test cases for performance-related 
+        non-functional requirements. Your expertise includes:
+        
+        - Response time measurement and optimization
+        - Throughput testing and analysis
+        - Resource utilization assessment (CPU, memory, disk, network)
+        - Latency identification and reduction
+        - Performance under load scenarios
+        - Bottleneck identification
+        - Performance benchmarking
+        - Cache effectiveness evaluation
+        
+        For each performance NFR, generate comprehensive test cases that include specific metrics, 
+        thresholds, tools, and methodologies appropriate for measuring and validating performance criteria.
+        Your test cases should be actionable, measurable, and include clear pass/fail criteria.
+        """
+
+class ScalabilityAgent(NFRAgent):
+    """Agent specialized in generating scalability test cases"""
+    
+    @property
+    def nfr_type(self) -> NFRType:
+        return NFRType.SCALABILITY
+    
+    @property
+    def system_prompt(self) -> str:
+        return """
+        You are a Scalability Testing Expert specializing in generating detailed test cases for scalability-related 
+        non-functional requirements. Your expertise includes:
+        
+        - Horizontal and vertical scaling scenarios
+        - Load balancing effectiveness
+        - Database scaling assessment
+        - Elastic scaling capability testing
+        - Distributed system scaling
+        - Resource allocation during scaling events
+        - Performance degradation during scaling
+        - Cost efficiency of scaling solutions
+        
+        For each scalability NFR, generate comprehensive test cases that include specific scaling scenarios, 
+        loads, metrics, and expected behaviors. Your test cases should verify the system's ability to 
+        handle growth in users, data volume, transaction volume, and other dimensions while maintaining 
+        acceptable performance characteristics.
+        """
+
+class ReliabilityAgent(NFRAgent):
+    """Agent specialized in generating reliability test cases"""
+    
+    @property
+    def nfr_type(self) -> NFRType:
+        return NFRType.RELIABILITY
+    
+    @property
+    def system_prompt(self) -> str:
+        return """
+        You are a Reliability Testing Expert specializing in generating detailed test cases for reliability-related 
+        non-functional requirements. Your expertise includes:
+        
+        - Fault tolerance verification
+        - Recovery testing (disaster recovery, backup restoration)
+        - Availability measurement
+        - Mean Time Between Failures (MTBF) assessment
+        - Mean Time To Recovery (MTTR) measurement
+        - Failover testing for high availability systems
+        - Degraded mode operation testing
+        - Long-duration stability testing
+        - Chaos engineering principles
+        
+        For each reliability NFR, generate comprehensive test cases that verify the system's ability to 
+        perform consistently under normal and adverse conditions, including specific failover scenarios, 
+        recovery procedures, and stability checks. Your test cases should include specific durations, 
+        conditions, and measurable reliability metrics.
+        """
+
+class UsabilityAgent(NFRAgent):
+    """Agent specialized in generating usability test cases"""
+    
+    @property
+    def nfr_type(self) -> NFRType:
+        return NFRType.USABILITY
+    
+    @property
+    def system_prompt(self) -> str:
+        return """
+        You are a Usability Testing Expert specializing in generating detailed test cases for usability-related 
+        non-functional requirements. Your expertise includes:
+        
+        - User experience (UX) evaluation
+        - Accessibility compliance testing (WCAG, Section 508)
+        - User interface consistency verification
+        - Task completion efficiency measurement
+        - Learnability assessment
+        - Error prevention and recovery from a user perspective
+        - Cross-device and responsive design testing
+        - User satisfaction metrics
+        - Internationalization and localization testing
+        
+        For each usability NFR, generate comprehensive test cases that include specific user scenarios, 
+        tasks, demographics, and evaluation criteria. Your test cases should verify that the system is 
+        intuitive, efficient, and satisfying for the intended users while meeting accessibility standards.
+        """
+
+class SecurityAgent(NFRAgent):
+    """Agent specialized in generating security test cases"""
+    
+    @property
+    def nfr_type(self) -> NFRType:
+        return NFRType.SECURITY
+    
+    @property
+    def system_prompt(self) -> str:
+        return """
+        You are a Security Testing Expert specializing in generating detailed test cases for security-related 
+        non-functional requirements. Your expertise includes:
+        
+        - Authentication and authorization testing
+        - Input validation and sanitization verification
+        - Protection against OWASP Top 10 vulnerabilities
+        - Data encryption in transit and at rest
+        - Session management security
+        - API security testing
+        - Secure configuration assessment
+        - Penetration testing scenarios
+        - Security logging and monitoring verification
+        - Privacy compliance testing (GDPR, CCPA, etc.)
+        
+        For each security NFR, generate comprehensive test cases that include specific security scenarios, 
+        attack vectors, test data, and verification steps. Your test cases should verify the system's 
+        ability to protect sensitive data, prevent unauthorized access, and detect/respond to security threats.
+        """
+
+# =============================================
+# NFR Classifier
+# =============================================
+
+class NFRClassifier:
+    """Classifies NFR descriptions into appropriate NFR types"""
+    
+    def __init__(self, llm_service: LLMService):
+        self.llm = llm_service.get_llm()
+        
+    def classify_nfr(self, nfr_description: str) -> NFRType:
+        """Determine the NFR type from the description"""
+        
+        # System prompt for the classifier
+        system_prompt = """
+        You are an expert in software requirements classification. Your task is to analyze the given 
+        Non-Functional Requirement (NFR) description and classify it into one of the following categories:
+
+        - performance: Related to response time, throughput, resource usage, efficiency
+        - scalability: Related to handling growth in users, data, or load
+        - reliability: Related to availability, fault tolerance, recovery, consistency
+        - usability: Related to user experience, accessibility, ease of use
+        - security: Related to data protection, authentication, authorization, vulnerabilities
+
+        Respond with only one word - the category name in lowercase.
+        """
+        
+        # Create messages
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"NFR Description: {nfr_description}")
+        ]
+        
+        # Get the response
+        response = self.llm.invoke(messages)
+        
+        # Extract the category
+        category = response.content.lower().strip()
+        
+        # Map to NFRType
+        try:
+            return NFRType(category)
+        except ValueError:
+            return NFRType.UNKNOWN
+
+# =============================================
+# NFR Test Case Generator System
+# =============================================
+
+class NFRTestCaseGenerator:
+    """Coordinates the NFR agents to generate test cases"""
+    
+    def __init__(self, config: Config = None):
+        # Use provided config or create from environment
+        self.config = config or Config.from_env()
+        
+        # Initialize LLM service
+        self.llm_service = LLMService(self.config)
+        
+        # Initialize classifier
+        self.classifier = NFRClassifier(self.llm_service)
+        
+        # Initialize agents
+        self.agents = {
+            NFRType.PERFORMANCE: PerformanceAgent(self.llm_service),
+            NFRType.SCALABILITY: ScalabilityAgent(self.llm_service),
+            NFRType.RELIABILITY: ReliabilityAgent(self.llm_service),
+            NFRType.USABILITY: UsabilityAgent(self.llm_service),
+            NFRType.SECURITY: SecurityAgent(self.llm_service),
+        }
+    
+    def generate_test_cases(self, 
+                           nfr_description: str, 
+                           application_context: str,
+                           nfr_type: Optional[NFRType] = None,
+                           custom_format: Optional[Dict[str, Any]] = None) -> Union[TestCaseResponse, Dict[NFRType, TestCaseResponse]]:
+        """
+        Generate test cases for the given NFR
+        
+        Args:
+            nfr_description: Description of the non-functional requirement
+            application_context: Context about the application being tested
+            nfr_type: Optional explicit NFR type, if not provided it will be classified
+            custom_format: Optional custom format specifications for test cases
+            
+        Returns:
+            TestCaseResponse with generated test cases or
+            Dictionary mapping NFR types to their TestCaseResponses (if multiple types detected)
+        """
+        # Handle custom format if provided
+        if custom_format:
+            return self._generate_with_custom_format(nfr_description, application_context, nfr_type, custom_format)
+        
+        # If NFR type is explicitly provided, generate for that type
+        if nfr_type is not None:
+            return self._generate_for_single_type(nfr_description, application_context, nfr_type)
+        
+        # Try to extract multiple NFR types from the description
+        nfr_types = self._extract_multiple_nfr_types(nfr_description)
+        
+        # If we detected multiple types, process each separately
+        if len(nfr_types) > 1:
+            return self._generate_for_multiple_types(nfr_description, application_context, nfr_types)
+        
+        # Default to single type processing if only one or none detected
+        detected_type = nfr_types[0] if nfr_types else self.classifier.classify_nfr(nfr_description)
+        return self._generate_for_single_type(nfr_description, application_context, detected_type)
+    
+    def _extract_multiple_nfr_types(self, nfr_description: str) -> List[NFRType]:
+        """
+        Extract multiple NFR types from a single description using the LLM
+        """
+        system_prompt = """
+        You are an expert in software requirements analysis. Your task is to analyze the given 
+        Non-Functional Requirement (NFR) description and identify ALL categories that apply.
+
+        The categories are:
+        - performance: Related to response time, throughput, resource usage, efficiency
+        - scalability: Related to handling growth in users, data, or load
+        - reliability: Related to availability, fault tolerance, recovery, consistency
+        - usability: Related to user experience, accessibility, ease of use
+        - security: Related to data protection, authentication, authorization, vulnerabilities
+
+        Respond with ONLY the category names that apply, in lowercase, separated by commas.
+        For example: "performance,security" or "usability" or "performance,scalability,reliability"
+        """
+        
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"NFR Description: {nfr_description}")
+        ]
+        
+        response = self.llm_service.get_llm().invoke(messages)
+        categories = [cat.strip() for cat in response.content.lower().split(',')]
+        
+        # Convert to NFRType and filter out invalid types
+        valid_types = []
+        for category in categories:
+            try:
+                valid_types.append(NFRType(category))
+            except ValueError:
+                pass
+                
+        return valid_types
+    
+    def _generate_for_single_type(self, 
+                                 nfr_description: str, 
+                                 application_context: str,
+                                 nfr_type: NFRType) -> TestCaseResponse:
+        """Generate test cases for a single NFR type"""
+        # Check if we have an agent for this NFR type
+        if nfr_type not in self.agents:
+            return TestCaseResponse(
+                test_cases=[],
+                nfr_type=NFRType.UNKNOWN,
+                summary=f"No agent available for NFR type: {nfr_type}",
+                recommendations=["Please specify a supported NFR type: performance, scalability, reliability, usability, or security."]
+            )
+        
+        # Get the appropriate agent
+        agent = self.agents[nfr_type]
+        
+        # Generate test cases
+        return agent.generate_test_cases(nfr_description, application_context)
+    
+    def _generate_for_multiple_types(self,
+                                    nfr_description: str,
+                                    application_context: str,
+                                    nfr_types: List[NFRType]) -> Dict[NFRType, TestCaseResponse]:
+        """Generate test cases for multiple NFR types from a single description"""
+        
+        # First, use the LLM to segment the description by NFR type
+        segments = self._segment_nfr_description(nfr_description, nfr_types)
+        
+        # Generate test cases for each type with its relevant segment
+        results = {}
+        for nfr_type in nfr_types:
+            segment = segments.get(nfr_type, nfr_description)
+            results[nfr_type] = self._generate_for_single_type(segment, application_context, nfr_type)
+            
+        return results
+    
+    def _segment_nfr_description(self, nfr_description: str, nfr_types: List[NFRType]) -> Dict[NFRType, str]:
+        """
+        Use the LLM to segment a mixed NFR description into type-specific sections
+        """
+        system_prompt = """
+        You are an expert in software requirements analysis. Your task is to analyze the given 
+        Non-Functional Requirement (NFR) description and segment it by NFR type.
+
+        Extract relevant parts of the description for each of the specified NFR types.
+        Respond with a JSON object where:
+        - Keys are the NFR types
+        - Values are the relevant segments of the description for each type
+
+        For parts of the description that apply to multiple types, include them in all relevant types.
+        """
+        
+        types_str = ", ".join([t.value for t in nfr_types])
+        
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"NFR Description: {nfr_description}\n\nNFR Types to segment: {types_str}")
+        ]
+        
+        response = self.llm_service.get_llm().invoke(messages)
+        
+        try:
+            # Extract JSON from the response (it might be wrapped in markdown code blocks)
+            json_str = response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+                
+            segments = json.loads(json_str)
+            
+            # Convert string keys to NFRType enum
+            typed_segments = {}
+            for key, value in segments.items():
+                try:
+                    typed_segments[NFRType(key)] = value
+                except ValueError:
+                    # Skip invalid types
+                    pass
+                    
+            return typed_segments
+            
+        except Exception as e:
+            # If parsing fails, return empty dict
+            print(f"Error segmenting NFR description: {e}")
+            return {}
+    
+    def _generate_with_custom_format(self,
+                                    nfr_description: str,
+                                    application_context: str,
+                                    nfr_type: Optional[NFRType],
+                                    custom_format: Dict[str, Any]) -> Union[TestCaseResponse, Dict[NFRType, TestCaseResponse]]:
+        """Generate test cases with a custom format specified by the user"""
+        
+        # Extract format instructions from custom_format
+        format_instructions = self._create_format_instructions(custom_format)
+        
+        # If no specific NFR type, check for multiple types
+        if nfr_type is None:
+            nfr_types = self._extract_multiple_nfr_types(nfr_description)
+            
+            if len(nfr_types) > 1:
+                # Handle multiple NFR types with custom format
+                segments = self._segment_nfr_description(nfr_description, nfr_types)
+                results = {}
+                
+                for type_value in nfr_types:
+                    segment = segments.get(type_value, nfr_description)
+                    results[type_value] = self._generate_with_custom_format_for_type(
+                        segment, application_context, type_value, format_instructions
+                    )
+                
+                return results
+            
+            # Default to single type
+            nfr_type = nfr_types[0] if nfr_types else self.classifier.classify_nfr(nfr_description)
+        
+        # Generate for single type with custom format
+        return self._generate_with_custom_format_for_type(
+            nfr_description, application_context, nfr_type, format_instructions
+        )
+    
+    def _generate_with_custom_format_for_type(self,
+                                             nfr_description: str,
+                                             application_context: str,
+                                             nfr_type: NFRType,
+                                             format_instructions: str) -> TestCaseResponse:
+        """Generate test cases for a specific NFR type with custom format"""
+        
+        if nfr_type not in self.agents:
+            return TestCaseResponse(
+                test_cases=[],
+                nfr_type=NFRType.UNKNOWN,
+                summary=f"No agent available for NFR type: {nfr_type}",
+                recommendations=["Please specify a supported NFR type."]
+            )
+        
+        agent = self.agents[nfr_type]
+        
+        # Create a custom prompt for this format
+        template = (
+            agent.system_prompt + 
+            "\n\n" +
+            "NFR Description: {nfr_description}\n\n" +
+            "Application Context: {application_context}\n\n" +
+            "Custom Format Instructions: {format_instructions}\n\n" +
+            "Generate detailed test cases for this NFR following the custom format specifications."
+        )
+        
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=["nfr_description", "application_context", "format_instructions"],
+        )
+        
+        chain = LLMChain(llm=agent.llm, prompt=prompt)
+        
+        result = chain.run(
+            nfr_description=nfr_description,
+            application_context=application_context,
+            format_instructions=format_instructions
+        )
+        
+        # Since we're using a custom format, we'll need to parse it differently
+        # For now, we'll convert it to our standard format, but this could be customized further
+        try:
+            # Use agent's output parser with an additional interpretation step
+            system_prompt = f"""
+            You are an expert in converting test case formats. Convert the following test cases into 
+            a valid JSON format that conforms to this schema:
+            
+            {agent.output_parser.get_format_instructions()}
+            
+            Return ONLY the JSON without any explanation.
+            """
+            
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"Test cases to convert: {result}")
+            ]
+            
+            json_response = agent.llm.invoke(messages)
+            json_str = json_response.content
+            
+            # Extract JSON if wrapped in code blocks
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+                
+            parsed_result = agent.output_parser.parse(json_str)
+            return parsed_result
+            
+        except Exception as e:
+            # Fallback in case parsing fails
+            print(f"Error parsing custom format result: {e}")
+            return TestCaseResponse(
+                test_cases=[],
+                nfr_type=nfr_type,
+                summary=f"Generated test cases with custom format. Unable to convert to standard format: {str(e)}",
+                recommendations=["The test cases were generated with your custom format, but could not be parsed into the standard structure."]
+            )
+    
+    def _create_format_instructions(self, custom_format: Dict[str, Any]) -> str:
+        """Convert the custom format specifications into instructions for the LLM"""
+        
+        # Extract format specifications
+        sections = custom_format.get("sections", [])
+        structure = custom_format.get("structure", "default")
+        fields = custom_format.get("fields", {})
+        examples = custom_format.get("examples", [])
+        
+        # Build instructions
+        instructions = "Please format the test cases according to these specifications:\n\n"
+        
+        if structure != "default":
+            instructions += f"Overall structure: {structure}\n\n"
+        
+        if sections:
+            instructions += "Include the following sections for each test case:\n"
+            for section in sections:
+                instructions += f"- {section}\n"
+            instructions += "\n"
+        
+        if fields:
+            instructions += "Use the following fields with these descriptions:\n"
+            for field_name, field_desc in fields.items():
+                instructions += f"- {field_name}: {field_desc}\n"
+            instructions += "\n"
+        
+        if examples:
+            instructions += "Format examples:\n"
+            for i, example in enumerate(examples):
+                instructions += f"Example {i+1}:\n{example}\n\n"
+        
+        return instructions
+    
+    def add_agent(self, agent: NFRAgent):
+        """Add a new agent to the system"""
+        self.agents[agent.nfr_type] = agent
+
+# =============================================
+# Usage Example
+# =============================================
+
+def main():
+    # Initialize the system
+    generator = NFRTestCaseGenerator()
+    
+    # Example 1: Single NFR type
+    print("\n=== Example 1: Single NFR Type ===")
+    
+    nfr_description = """
+    The system must respond to user requests within 2 seconds under normal load
+    and within 5 seconds under peak load (defined as 1000 concurrent users).
+    API endpoints must process requests with a throughput of at least 100 requests per second.
+    """
+    
+    application_context = """
+    E-commerce web application with user authentication, product catalog,
+    shopping cart, payment processing, and order management functionality.
+    Built with a React frontend, Node.js backend, and PostgreSQL database.
+    Hosted on AWS using ECS for containerization.
+    """
+    
+    response = generator.generate_test_cases(
+        nfr_description=nfr_description,
+        application_context=application_context
+    )
+    
+    print(f"NFR Type: {response.nfr_type}")
+    print(f"Summary: {response.summary}")
+    print(f"Number of test cases: {len(response.test_cases)}")
+    
+    # Example 2: Multiple NFR types in one description
+    print("\n=== Example 2: Multiple NFR Types ===")
+    
+    multi_nfr_description = """
+    Performance: The system must respond to user requests within 2 seconds under normal load.
+    
+    Security: All user data must be encrypted in transit and at rest. The system must
+    implement proper authentication and authorization controls.
+    
+    Scalability: The system must handle a 200% increase in user load without degradation
+    in performance, and must automatically scale resources as needed.
+    """
+    
+    multi_response = generator.generate_test_cases(
+        nfr_description=multi_nfr_description,
+        application_context=application_context
+    )
+    
+    # Print results for each NFR type
+    for nfr_type, response in multi_response.items():
+        print(f"\nNFR Type: {nfr_type}")
+        print(f"Summary: {response.summary}")
+        print(f"Number of test cases: {len(response.test_cases)}")
+    
+    # Example 3: Custom format
+    print("\n=== Example 3: Custom Format ===")
+    
+    custom_format = {
+        "structure": "gherkin",
+        "sections": ["Feature", "Scenario", "Given", "When", "Then", "And"],
+        "fields": {
+            "nfr_category": "Type of NFR being tested",
+            "priority": "Test priority (P0, P1, P2)",
+            "automated": "Whether the test can be automated (Yes/No)"
+        },
+        "examples": [
+            """
+            Feature: API Response Time
+            
+            Scenario: Response time under normal load
+              Given the system is under normal load (100 concurrent users)
+              When a user makes a request to the /products endpoint
+              Then the response should be received within 2 seconds
+              And the response should contain valid data
+            
+            @nfr_category=performance
+            @priority=P0
+            @automated=Yes
+            """
+        ]
+    }
+    
+    custom_response = generator.generate_test_cases(
+        nfr_description=nfr_description,
+        application_context=application_context,
+        nfr_type=NFRType.PERFORMANCE,
+        custom_format=custom_format
+    )
+    
+    print(f"NFR Type: {custom_response.nfr_type}")
+    print(f"Summary: {custom_response.summary}")
+    print(f"Number of test cases: {len(custom_response.test_cases)}")
+    
+    # Export all results to JSON
+    with open("nfr_test_cases.json", "w") as f:
+        results = {
+            "single_nfr": response.dict(),
+            "multi_nfr": {nfr.value: resp.dict() for nfr, resp in multi_response.items()},
+            "custom_format": custom_response.dict()
+        }
+        json.dump(results, f, indent=2)
+
+if __name__ == "__main__":
+    main()
